@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+  <title>Mapa de Rutas</title>
+
+  <!-- Estilos de Leaflet -->
+  <link rel="preconnect" href="https://nominatim.openstreetmap.org" />
+  <link rel="preconnect" href="https://router.project-osrm.org" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    body, html { margin: 0; padding: 0; height: 100%; width: 100%; font-family: Arial, sans-serif; }
+    #map { height: 100%; width: 100%; z-index: 1; }
+
+    .control-panel {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 90%;
+      max-width: 400px;
+      background: white;
+      padding: 12px;
+      border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .campo { position: relative; }
+
+    .control-panel input {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+
+    .sugerencias {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: white;
+      border: 1px solid #ccc;
+      border-top: none;
+      border-radius: 0 0 6px 6px;
+      box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+      max-height: 220px;
+      overflow-y: auto;
+      z-index: 2000;
+      display: none;
+    }
+    .sugerencias div {
+      padding: 10px;
+      font-size: 13px;
+      cursor: pointer;
+      border-bottom: 1px solid #eee;
+    }
+    .sugerencias div:last-child { border-bottom: none; }
+    .sugerencias div:hover { background: #f1f5ff; }
+    .sugerencias .sin-resultados { color: #888; cursor: default; }
+    .sugerencias .sin-resultados:hover { background: white; }
+
+    .btn-buscar {
+      background-color: #007bff;
+      color: white;
+      border: none;
+      padding: 10px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .btn-buscar:disabled { opacity: 0.6; cursor: wait; }
+
+    .btn-chofer {
+      background-color: #28a745;
+      color: white;
+      border: none;
+      padding: 12px;
+      border-radius: 6px;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 15px;
+    }
+    .btn-chofer:disabled { background-color: #9bb8a2; cursor: not-allowed; }
+
+    #info {
+      font-size: 13px;
+      color: #333;
+      line-height: 1.4;
+      display: none;
+    }
+    #info .azul { color: #1e66f5; font-weight: bold; }
+    #info .rojo { color: #e53935; font-weight: bold; }
+
+    .icono-chofer {
+      font-size: 28px;
+      line-height: 28px;
+      text-align: center;
+      filter: drop-shadow(0 2px 3px rgba(0,0,0,0.5));
+    }
+  </style>
+</head>
+<body>
+
+  <div class="control-panel">
+    <div class="campo">
+      <input type="text" id="origen" placeholder="Dirección de origen..." autocomplete="off" />
+      <div class="sugerencias" id="sug-origen"></div>
+    </div>
+    <div class="campo">
+      <input type="text" id="destino" placeholder="Dirección de destino..." autocomplete="off" />
+      <div class="sugerencias" id="sug-destino"></div>
+    </div>
+    <button class="btn-buscar" id="btnBuscar" onclick="trazarRuta()">Trazar Ruta</button>
+    <div id="info"></div>
+    <button class="btn-chofer" id="btnChofer" onclick="pedirChofer()" disabled>Pedir Chofer</button>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ---------- Configuración ----------
+    const PAIS = 'cl';          // País para las sugerencias (código ISO). '' = todo el mundo
+    const APPHIVE_URL = '';     // Opcional: URL de Apphive a la que volver
+    const FACTOR_MICRO = 2.2;   // La micro es más lenta que un auto (paradas, semáforos)
+    const ESPERA_SUGERENCIAS = 350; // ms tras dejar de escribir
+
+    const map = L.map('map').setView([-33.0472, -71.6127], 13);
+
+    // ---------- Mapa base (sin API key, con respaldos) ----------
+    const proveedores = [
+      {
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+        opciones: { maxZoom: 19, attribution: 'Tiles © Esri — Esri, HERE, Garmin, OpenStreetMap contributors' }
+      },
+      {
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
+        opciones: { maxZoom: 19, attribution: 'Tiles © Esri' }
+      },
+      {
+        url: 'https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+        opciones: { maxZoom: 17, subdomains: 'abc', attribution: '© OpenTopoMap, © OpenStreetMap contributors' }
+      }
+    ];
+
+    let indiceProveedor = 0;
+    let capaBase = null;
+    let erroresTiles = 0;
+
+    function cargarProveedor() {
+      if (capaBase) map.removeLayer(capaBase);
+      const p = proveedores[indiceProveedor];
+      erroresTiles = 0;
+      capaBase = L.tileLayer(p.url, p.opciones).addTo(map);
+      capaBase.on('tileerror', () => {
+        erroresTiles++;
+        if (erroresTiles >= 3 && indiceProveedor < proveedores.length - 1) {
+          indiceProveedor++;
+          cargarProveedor();
+        }
+      });
+    }
+    cargarProveedor();
+
+    setTimeout(() => map.invalidateSize(), 300);
+    window.addEventListener('resize', () => map.invalidateSize());
+
+    // ---------- Estado ----------
+    let origenCoords = null;
+    let destinoCoords = null;
+    let routeLayer = null;
+    let origenMarker = null;
+    let destinoMarker = null;
+    let choferMarker = null;
+    let choferRouteLayer = null;
+    let choferData = null;
+
+    // ---------- Búsqueda de direcciones (Nominatim) con caché ----------
+    const cacheBusquedas = new Map();
+
+    async function buscarDirecciones(texto, limite) {
+      const clave = limite + '|' + texto.toLowerCase();
+      if (cacheBusquedas.has(clave)) return cacheBusquedas.get(clave);
+
+      let url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=0&limit=${limite}` +
+                `&accept-language=es&q=${encodeURIComponent(texto)}`;
+      if (PAIS) url += `&countrycodes=${PAIS}`;
+
+      const res = await fetch(url);
+      const datos = await res.json();
+      cacheBusquedas.set(clave, datos);
+      return datos;
+    }
+
+    async function obtenerCoordenadas(direccion) {
+      const data = await buscarDirecciones(direccion, 1);
+      if (data && data.length > 0) {
+        return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), nombre: data[0].display_name };
+      }
+      return null;
+    }
+
+    // ---------- Autocompletado ----------
+    function configurarAutocompletado(inputId, listaId, alElegir) {
+      const input = document.getElementById(inputId);
+      const lista = document.getElementById(listaId);
+      let temporizador = null;
+      let contador = 0;
+
+      function ocultar() { lista.style.display = 'none'; lista.innerHTML = ''; }
+
+      input.addEventListener('input', () => {
+        alElegir(null);
+        clearTimeout(temporizador);
+        const texto = input.value.trim();
+        if (texto.length < 3) { ocultar(); return; }
+
+        temporizador = setTimeout(async () => {
+          const miBusqueda = ++contador;
+          try {
+            const datos = await buscarDirecciones(texto, 5);
+            if (miBusqueda !== contador) return;
+
+            lista.innerHTML = '';
+            if (!datos.length) {
+              const vacio = document.createElement('div');
+              vacio.className = 'sin-resultados';
+              vacio.textContent = 'Sin resultados';
+              lista.appendChild(vacio);
+            } else {
+              datos.forEach(lugar => {
+                const item = document.createElement('div');
+                item.textContent = lugar.display_name;
+                item.addEventListener('mousedown', (e) => {
+                  e.preventDefault();
+                  input.value = lugar.display_name;
+                  alElegir({ lat: parseFloat(lugar.lat), lng: parseFloat(lugar.lon), nombre: lugar.display_name });
+                  ocultar();
+                });
+                lista.appendChild(item);
+              });
+            }
+            lista.style.display = 'block';
+          } catch (err) {
+            ocultar();
+          }
+        }, ESPERA_SUGERENCIAS);
+      });
+
+      input.addEventListener('blur', () => setTimeout(ocultar, 150));
+    }
+
+    configurarAutocompletado('origen', 'sug-origen', (c) => { origenCoords = c; });
+    configurarAutocompletado('destino', 'sug-destino', (c) => { destinoCoords = c; });
+
+    // ---------- Rutas (OSRM) ----------
+    async function pedirRuta(a, b) {
+      const url = `https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+      const res = await fetch(url);
+      const data = await res.json();
+      return (data.routes && data.routes.length > 0) ? data.routes[0] : null;
+    }
+
+    // ---------- Chofer (micro) simulado ----------
+    const NOMBRES_CHOFER = ['Carlos', 'Marcela', 'Jorge', 'Pamela', 'Luis', 'Andrea', 'Felipe', 'Daniela'];
+    const LINEAS = ['201', '210', '305', '412', '506', '620', 'B15', 'C08'];
+
+    function generarChofer(origen) {
+      // Posición aleatoria a 0.5 - 2 km del origen
+      const distanciaKm = 0.5 + Math.random() * 1.5;
+      const angulo = Math.random() * 2 * Math.PI;
+      const dLat = (distanciaKm * Math.cos(angulo)) / 111;
+      const dLng = (distanciaKm * Math.sin(angulo)) / (111 * Math.cos(origen.lat * Math.PI / 180));
+      return {
+        lat: origen.lat + dLat,
+        lng: origen.lng + dLng,
+        distanciaKm: distanciaKm,
+        nombre: NOMBRES_CHOFER[Math.floor(Math.random() * NOMBRES_CHOFER.length)],
+        linea: LINEAS[Math.floor(Math.random() * LINEAS.length)]
+      };
+    }
+
+    // ---------- Trazar ruta ----------
+    async function trazarRuta() {
+      const textoOrigen = document.getElementById('origen').value.trim();
+      const textoDestino = document.getElementById('destino').value.trim();
+
+      if (!textoOrigen || !textoDestino) {
+        alert("Por favor ingresa origen y destino");
+        return;
+      }
+
+      const btnBuscar = document.getElementById('btnBuscar');
+      const btnChofer = document.getElementById('btnChofer');
+      btnBuscar.disabled = true;
+      btnBuscar.textContent = 'Trazando...';
+      btnChofer.disabled = true;
+      btnChofer.textContent = 'Pedir Chofer';
+
+      try {
+        // Buscar origen y destino al mismo tiempo (si no se eligieron de la lista)
+        const [o, d] = await Promise.all([
+          origenCoords || obtenerCoordenadas(textoOrigen),
+          destinoCoords || obtenerCoordenadas(textoDestino)
+        ]);
+        origenCoords = o;
+        destinoCoords = d;
+
+        if (!origenCoords || !destinoCoords) {
+          alert("No se pudieron encontrar las direcciones. Intenta ser más específico.");
+          return;
+        }
+
+        // Limpiar capas anteriores
+        [routeLayer, origenMarker, destinoMarker, choferMarker, choferRouteLayer].forEach(c => { if (c) map.removeLayer(c); });
+        choferData = null;
+
+        origenMarker = L.marker([origenCoords.lat, origenCoords.lng]).addTo(map).bindPopup("Origen").openPopup();
+        destinoMarker = L.marker([destinoCoords.lat, destinoCoords.lng]).addTo(map).bindPopup("Destino");
+
+        // Chofer: posición aleatoria cerca del origen
+        const chofer = generarChofer(origenCoords);
+        choferMarker = L.marker([chofer.lat, chofer.lng], {
+          icon: L.divIcon({ className: '', html: '<div class="icono-chofer">🚌</div>', iconSize: [28, 28], iconAnchor: [14, 14] })
+        }).addTo(map).bindPopup("Micro " + chofer.linea + " · Chofer: " + chofer.nombre);
+
+        // Pedir las dos rutas al mismo tiempo: viaje (rojo) y chofer -> origen (azul)
+        const [rutaViaje, rutaChofer] = await Promise.all([
+          pedirRuta(origenCoords, destinoCoords),
+          pedirRuta({ lat: chofer.lat, lng: chofer.lng }, origenCoords).catch(() => null)
+        ]);
+
+        if (!rutaViaje) {
+          alert("No se encontró una ruta entre esos puntos.");
+          return;
+        }
+
+        // Ruta del viaje en ROJO
+        routeLayer = L.geoJSON(rutaViaje.geometry, {
+          style: { color: '#e53935', weight: 5, opacity: 0.9 }
+        }).addTo(map);
+
+        // Ruta del chofer en AZUL
+        let kmLlegada = chofer.distanciaKm;
+        let minLlegada = Math.max(1, Math.round(chofer.distanciaKm * 4));
+        if (rutaChofer) {
+          choferRouteLayer = L.geoJSON(rutaChofer.geometry, {
+            style: { color: '#1e66f5', weight: 5, opacity: 0.9, dashArray: '8 8' }
+          }).addTo(map);
+          kmLlegada = rutaChofer.distance / 1000;
+          minLlegada = Math.max(1, Math.round(rutaChofer.duration / 60 * FACTOR_MICRO));
+        }
+
+        const kmViaje = (rutaViaje.distance / 1000).toFixed(1);
+        const minViaje = Math.max(1, Math.round(rutaViaje.duration / 60 * FACTOR_MICRO));
+
+        choferData = {
+          tipo: 'micro',
+          linea: chofer.linea,
+          nombre: chofer.nombre,
+          lat: chofer.lat,
+          lng: chofer.lng,
+          minutos_llegada: minLlegada,
+          km_hasta_origen: parseFloat(kmLlegada.toFixed(1))
+        };
+
+        const info = document.getElementById('info');
+        info.innerHTML = `<span class="rojo">Viaje:</span> ${kmViaje} km · ~${minViaje} min<br>` +
+                         `<span class="azul">Micro ${chofer.linea} (${chofer.nombre}):</span> llega en ~${minLlegada} min (${kmLlegada.toFixed(1)} km)`;
+        info.style.display = 'block';
+
+        const grupo = L.featureGroup([routeLayer, choferRouteLayer, choferMarker].filter(Boolean));
+        map.fitBounds(grupo.getBounds(), { padding: [50, 50] });
+
+        btnChofer.disabled = false;
+      } catch (err) {
+        alert("Ocurrió un error al trazar la ruta. Revisa tu conexión e intenta de nuevo.");
+      } finally {
+        btnBuscar.disabled = false;
+        btnBuscar.textContent = 'Trazar Ruta';
+      }
+    }
+
+    // ---------- Pedir chofer y volver a Apphive ----------
+    function pedirChofer() {
+      if (!origenCoords || !destinoCoords) return;
+
+      const datosViaje = {
+        evento: "pedir_chofer",
+        origen: origenCoords,
+        destino: destinoCoords,
+        chofer: choferData
+      };
+      const mensaje = JSON.stringify(datosViaje);
+
+      try { if (window.parent && window.parent !== window) window.parent.postMessage(mensaje, "*"); } catch (e) {}
+      try { if (window.top && window.top !== window) window.top.postMessage(mensaje, "*"); } catch (e) {}
+      try { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(mensaje); } catch (e) {}
+      try { if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.apphive) window.webkit.messageHandlers.apphive.postMessage(mensaje); } catch (e) {}
+      try { if (window.Android && window.Android.postMessage) window.Android.postMessage(mensaje); } catch (e) {}
+
+      const btn = document.getElementById('btnChofer');
+      btn.disabled = true;
+      btn.textContent = '✔ Solicitud enviada, volviendo a Apphive...';
+
+      setTimeout(() => {
+        try {
+          if (APPHIVE_URL) {
+            (window.top || window).location.href = APPHIVE_URL;
+          } else if (document.referrer) {
+            (window.top || window).location.href = document.referrer;
+          } else if (window.history.length > 1) {
+            window.history.back();
+          } else {
+            window.close();
+          }
+        } catch (e) {
+          if (APPHIVE_URL) window.location.href = APPHIVE_URL;
+        }
+      }, 300);
+    }
+  </script>
+</body>
+</html>
